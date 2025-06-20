@@ -11,46 +11,23 @@ from datasets import Value
 from huggingface_hub import HfApi
 from PIL import Image
 from tqdm.auto import tqdm
+from utils import load_hand_model, build_system_prompt
 
-# Set up the model and data
-model = mujoco.MjModel.from_xml_path("shadow_hand/left_hand.xml")
-data = mujoco.MjData(model)
-renderer = mujoco.Renderer(model, height=1280, width=1280)
-joint_names = [
-    "lh_WRJ2",
-    "lh_WRJ1",
-    "lh_FFJ4",
-    "lh_FFJ3",
-    "lh_FFJ2",
-    "lh_FFJ1",
-    "lh_MFJ4",
-    "lh_MFJ3",
-    "lh_MFJ2",
-    "lh_MFJ1",
-    "lh_RFJ4",
-    "lh_RFJ3",
-    "lh_RFJ2",
-    "lh_RFJ1",
-    "lh_LFJ5",
-    "lh_LFJ4",
-    "lh_LFJ3",
-    "lh_LFJ2",
-    "lh_LFJ1",
-    "lh_THJ5",
-    "lh_THJ4",
-    "lh_THJ3",
-    "lh_THJ2",
-    "lh_THJ1",
-]
-SYSTEM_PROMPT = """You are a specialized Vision Language Model designed to accurately estimate joint angles from hand pose images. Your task is to analyze images of a human or robotic hand and output precise angle measurements for each joint. Output joint angles in radians.
-Output Format:
-<lh_WRJ2>angle</lh_WRJ2><lh_WRJ1>angle</lh_WRJ1><lh_FFJ4>angle</lh_FFJ4><lh_FFJ3>angle</lh_FFJ3><lh_FFJ2>angle</lh_FFJ2><lh_FFJ1>angle</lh_FFJ1><lh_MFJ4>angle</lh_MFJ4><lh_MFJ3>angle</lh_MFJ3><lh_MFJ2>angle</lh_MFJ2><lh_MFJ1>angle</lh_MFJ1><lh_RFJ4>angle</lh_RFJ4><lh_RFJ3>angle</lh_RFJ3><lh_RFJ2>angle</lh_RFJ2><lh_RFJ1>angle</lh_RFJ1><lh_LFJ5>angle</lh_LFJ5><lh_LFJ4>angle</lh_LFJ4><lh_LFJ3>angle</lh_LFJ3><lh_LFJ2>angle</lh_LFJ2><lh_LFJ1>angle</lh_LFJ1><lh_THJ5>angle</lh_THJ5><lh_THJ4>angle</lh_THJ4><lh_THJ3>angle</lh_THJ3><lh_THJ2>angle</lh_THJ2><lh_THJ1>angle</lh_THJ1>
-"""
-joint_name_to_index = {name: i for i, name in enumerate(joint_names)}
+# Remove hard-coded model initialisation – these will be loaded at runtime
+model = None  # placeholder, populated in __main__
+data = None
+renderer = None
+joint_names = []
+joint_name_to_index = {}
+SYSTEM_PROMPT = ""  # will be built dynamically
 
 
 def get_n_pose_and_upload(
-    n, dataset_name="hand-poses-dataset", push_to_hub=True, num_test_sample=1000
+    n,
+    dataset_name="hand-poses-dataset",
+    push_to_hub=True,
+    num_test_sample=1000,
+    output_dir="data",
 ):
     assert (
         num_test_sample < n
@@ -59,12 +36,13 @@ def get_n_pose_and_upload(
 
     global joint_names, joint_name_to_index, SYSTEM_PROMPT
 
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     # Prepare data structures for the dataset
     images_data = []
     joint_positions = []
     filenames = []
+    index_mapping = {}
 
     pose_num = 0
     pbar = tqdm(total=n, desc="Generating poses", unit="pose")
@@ -108,11 +86,15 @@ def get_n_pose_and_upload(
         buf.seek(0)
 
         image_filename = f"pose_{pose_num}.png"
-        image_path = os.path.join("data", image_filename)
+        image_path = os.path.join(output_dir, image_filename)
         image.save(image_path)
 
-        joint_positions.append(data.qpos.copy().tolist())
+        # Build angle list in the order of joint_names for _index.json
+        angle_list = [round(data.qpos[joint_name_to_index[name]], 4) for name in joint_names]
+        index_mapping[image_filename] = angle_list
+
         filenames.append(image_filename)
+        joint_positions.append(data.qpos.copy().tolist())
 
         buf.close()
         image.close()
@@ -138,7 +120,7 @@ def get_n_pose_and_upload(
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "content": f"data/{filenames[i]}"},
+                    {"type": "image", "content": f"{output_dir}/{filenames[i]}"},
                     {"type": "text", "content": "<Pose>"},
                 ],
             },
@@ -152,13 +134,13 @@ def get_n_pose_and_upload(
         conversations.append(conversation)
 
     conversations_json = [json.dumps(conv) for conv in conversations]
-    output_path = "data/conversations_dataset.jsonl"
+    output_path = os.path.join(output_dir, "conversations_dataset.jsonl")
     with open(output_path, "w") as f:
         for conv_json in conversations_json:
             f.write(conv_json + "\n")
 
     for image_path in filenames:
-        images_data.append(Image.open(f"data/{image_path}"))
+        images_data.append(Image.open(os.path.join(output_dir, image_path)))
 
     dataset_dict = {
         "image": images_data,
@@ -186,8 +168,15 @@ def get_n_pose_and_upload(
         "total_poses": n,
     }
 
-    with open(os.path.join("data", "_metadata.json"), "w") as f:
+    with open(os.path.join(output_dir, "_metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
+
+    # Save legacy index/name files
+    with open(os.path.join(output_dir, "_index.json"), "w") as f:
+        json.dump(index_mapping, f, indent=2)
+
+    with open(os.path.join(output_dir, "_name.json"), "w") as f:
+        json.dump(joint_names, f, indent=2)
 
     if push_to_hub:
         try:
@@ -201,7 +190,7 @@ def get_n_pose_and_upload(
             api = HfApi()
             print("Uploading metadata...")
             api.upload_file(
-                path_or_fileobj=os.path.join("data", "_metadata.json"),
+                path_or_fileobj=os.path.join(output_dir, "_metadata.json"),
                 path_in_repo="_metadata.json",
                 repo_id=dataset_name,
                 repo_type="dataset",
@@ -210,11 +199,11 @@ def get_n_pose_and_upload(
         except Exception as e:
             print(f"Error uploading to Hugging Face Hub: {e}")
             print("Saving dataset locally instead")
-            dataset.save_to_disk("data/hf_dataset")
+            dataset.save_to_disk(os.path.join(output_dir, "hf_dataset"))
     else:
         print("Saving dataset locally")
         with tqdm(total=100, desc="Saving locally", unit="%") as pbar:
-            dataset.save_to_disk("data/hf_dataset")
+            dataset.save_to_disk(os.path.join(output_dir, "hf_dataset"))
             pbar.update(100)
 
     # Clean up resources
@@ -236,6 +225,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("n", type=int, help="Number of poses to generate")
     parser.add_argument(
+        "--hand",
+        type=str,
+        default="shadow_hand",
+        help="Name of the hand model (directory under ./models or explicit XML path)",
+    )
+    parser.add_argument(
         "--dataset_name",
         type=str,
         default="jan-hq/robotic-hand-poses",
@@ -249,17 +244,31 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_test_samples",
         type=int,
-        default="1000",
+        default=1000,
         help="Number of test samples to split",
     )
 
     args = parser.parse_args()
 
-    print(f"Starting generation of {args.n} hand poses...")
+    # Dynamically load the requested hand model and rebuild globals
+    model, data, renderer, joint_names, joint_name_to_index = load_hand_model(args.hand)
+    SYSTEM_PROMPT = build_system_prompt(joint_names)
+
+    print(f"Starting generation of {args.n} hand poses for hand '{args.hand}' ...")
     start_time = time.time()
+
+    # Create dedicated output directory under data/
+    timestamp = time.strftime("%y%m%d%H%M%S")
+    output_dir = os.path.join("data", f"{args.hand}_{timestamp}")
+
     get_n_pose_and_upload(
-        args.n, args.dataset_name, not args.no_push, args.num_test_samples
+        args.n,
+        args.dataset_name,
+        not args.no_push,
+        args.num_test_samples,
+        output_dir,
     )
+
     end_time = time.time()
 
     elapsed_time = end_time - start_time

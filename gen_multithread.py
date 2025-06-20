@@ -14,44 +14,17 @@ from datasets import Value
 from huggingface_hub import HfApi, login
 from PIL import Image
 from tqdm.auto import tqdm
+from utils import load_hand_model, build_system_prompt
 
 os.environ["MUJOCO_GL"] = "egl"
 
-# Set up the model and data
-model = mujoco.MjModel.from_xml_path("shadow_hand/left_hand.xml")
-data = mujoco.MjData(model)
-renderer = mujoco.Renderer(model, height=1280, width=1280)
-joint_names = [
-    "lh_WRJ2",
-    "lh_WRJ1",
-    "lh_FFJ4",
-    "lh_FFJ3",
-    "lh_FFJ2",
-    "lh_FFJ1",
-    "lh_MFJ4",
-    "lh_MFJ3",
-    "lh_MFJ2",
-    "lh_MFJ1",
-    "lh_RFJ4",
-    "lh_RFJ3",
-    "lh_RFJ2",
-    "lh_RFJ1",
-    "lh_LFJ5",
-    "lh_LFJ4",
-    "lh_LFJ3",
-    "lh_LFJ2",
-    "lh_LFJ1",
-    "lh_THJ5",
-    "lh_THJ4",
-    "lh_THJ3",
-    "lh_THJ2",
-    "lh_THJ1",
-]
-SYSTEM_PROMPT = """You are a specialized Vision Language Model designed to accurately estimate joint angles from hand pose images. Your task is to analyze images of a human or robotic hand and output precise angle measurements for each joint. Output joint angles in radians.
-Output Format:
-<lh_WRJ2>angle</lh_WRJ2><lh_WRJ1>angle</lh_WRJ1><lh_FFJ4>angle</lh_FFJ4><lh_FFJ3>angle</lh_FFJ3><lh_FFJ2>angle</lh_FFJ2><lh_FFJ1>angle</lh_FFJ1><lh_MFJ4>angle</lh_MFJ4><lh_MFJ3>angle</lh_MFJ3><lh_MFJ2>angle</lh_MFJ2><lh_MFJ1>angle</lh_MFJ1><lh_RFJ4>angle</lh_RFJ4><lh_RFJ3>angle</lh_RFJ3><lh_RFJ2>angle</lh_RFJ2><lh_RFJ1>angle</lh_RFJ1><lh_LFJ5>angle</lh_LFJ5><lh_LFJ4>angle</lh_LFJ4><lh_LFJ3>angle</lh_LFJ3><lh_LFJ2>angle</lh_LFJ2><lh_LFJ1>angle</lh_LFJ1><lh_THJ5>angle</lh_THJ5><lh_THJ4>angle</lh_THJ4><lh_THJ3>angle</lh_THJ3><lh_THJ2>angle</lh_THJ2><lh_THJ1>angle</lh_THJ1>
-"""
-joint_name_to_index = {name: i for i, name in enumerate(joint_names)}
+# Global placeholders – populated at runtime
+model = None
+data = None
+renderer = None
+joint_names = []
+joint_name_to_index = {}
+SYSTEM_PROMPT = ""
 
 nthread = 32
 
@@ -84,7 +57,7 @@ def calculate_thread_ranges(total_poses, num_threads):
     return thread_ranges
 
 
-def generate_pose_chunk(thread_id, start_idx, end_idx):
+def generate_pose_chunk(thread_id, start_idx, end_idx, output_dir):
     """Generate a chunk of poses using MuJoCo simulation"""
     # Create local model and data copies for this thread
     local_model = copy.deepcopy(model)
@@ -131,7 +104,7 @@ def generate_pose_chunk(thread_id, start_idx, end_idx):
         pixels = local_renderer.render()
 
         image_filename = f"pose_{pose_num:06d}.png"
-        image_path = os.path.join("data", image_filename)
+        image_path = os.path.join(output_dir, image_filename)
         image = Image.fromarray(pixels)
         image.save(image_path)
 
@@ -142,7 +115,11 @@ def generate_pose_chunk(thread_id, start_idx, end_idx):
 
 
 def get_n_pose_and_upload(
-    n, dataset_name="hand-poses-dataset", push_to_hub=True, num_test_sample=1000
+    n,
+    dataset_name="hand-poses-dataset",
+    push_to_hub=True,
+    num_test_sample=1000,
+    output_dir="data",
 ):
     """Generate n random hand poses using parallel processing and upload to Hugging Face."""
     global joint_names, joint_name_to_index, SYSTEM_PROMPT, nthread
@@ -151,12 +128,13 @@ def get_n_pose_and_upload(
         num_test_sample < n
     ), "The number of test samples must be lower than the total synthetic subset"
 
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     thread_ranges = calculate_thread_ranges(n, nthread)
 
     all_filenames = []
     all_joint_positions = []
+    index_mapping = {}
 
     print(f"Using {nthread} threads to generate {n} poses")
     print("Thread ranges:", thread_ranges)
@@ -171,6 +149,7 @@ def get_n_pose_and_upload(
                     thread_id,  # thread identifier
                     start_idx,  # start index for this thread
                     end_idx,  # end index for this thread
+                    output_dir,  # directory to save data
                 )
             )
 
@@ -183,6 +162,10 @@ def get_n_pose_and_upload(
             chunk_filenames, chunk_joint_positions = future.result()
             all_filenames.extend(chunk_filenames)
             all_joint_positions.extend(chunk_joint_positions)
+            # Build index mapping list per filename
+            for fname, angles in zip(chunk_filenames, chunk_joint_positions):
+                angle_list = [round(angles[joint_name_to_index[name]], 4) for name in joint_names]
+                index_mapping[fname] = angle_list
 
     print("Processing image data and creating conversations...")
 
@@ -205,7 +188,7 @@ def get_n_pose_and_upload(
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "content": f"data/{all_filenames[i]}"},
+                    {"type": "image", "content": f"{output_dir}/{all_filenames[i]}"},
                     {"type": "text", "content": "<Pose>"},
                 ],
             },
@@ -220,7 +203,7 @@ def get_n_pose_and_upload(
 
     # Save conversations to JSONL file
     conversations_json = [json.dumps(conv) for conv in conversations]
-    output_path = "data/conversations_dataset.jsonl"
+    output_path = os.path.join(output_dir, "conversations_dataset.jsonl")
     with open(output_path, "w") as f:
         for conv_json in conversations_json:
             f.write(conv_json + "\n")
@@ -229,7 +212,7 @@ def get_n_pose_and_upload(
     print("Loading images for dataset...")
     images_data = []
     for image_path in tqdm(all_filenames, desc="Loading images"):
-        images_data.append(Image.open(f"data/{image_path}"))
+        images_data.append(Image.open(os.path.join(output_dir, image_path)))
 
     # Create dataset dictionary
     dataset_dict = {
@@ -259,8 +242,15 @@ def get_n_pose_and_upload(
         "generation_method": "GPU-accelerated MuJoCo with multi-threading",
     }
 
-    with open(os.path.join("data", "_metadata.json"), "w") as f:
+    with open(os.path.join(output_dir, "_metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
+
+    # Save legacy index/name jsons
+    with open(os.path.join(output_dir, "_index.json"), "w") as f:
+        json.dump(index_mapping, f, indent=2)
+
+    with open(os.path.join(output_dir, "_name.json"), "w") as f:
+        json.dump(joint_names, f, indent=2)
 
     # Push to Hugging Face Hub or save locally
     if push_to_hub:
@@ -273,7 +263,7 @@ def get_n_pose_and_upload(
             api = HfApi()
             print("Uploading metadata...")
             api.upload_file(
-                path_or_fileobj=os.path.join("data", "_metadata.json"),
+                path_or_fileobj=os.path.join(output_dir, "_metadata.json"),
                 path_in_repo="_metadata.json",
                 repo_id=dataset_name,
                 repo_type="dataset",
@@ -282,10 +272,10 @@ def get_n_pose_and_upload(
         except Exception as e:
             print(f"Error uploading to Hugging Face Hub: {e}")
             print("Saving dataset locally instead")
-            dataset.save_to_disk("data/hf_dataset")
+            dataset.save_to_disk(os.path.join(output_dir, "hf_dataset"))
     else:
         print("Saving dataset locally")
-        dataset.save_to_disk("data/hf_dataset")
+        dataset.save_to_disk(os.path.join(output_dir, "hf_dataset"))
 
     # Clean up resources
     print("Cleaning up resources...")
@@ -300,7 +290,11 @@ def get_n_pose_and_upload(
 
 # Use MuJoCo's rollout for batch simulation (alternative approach)
 def get_n_pose_with_rollout(
-    n, dataset_name="hand-poses-dataset", push_to_hub=True, num_test_sample=1000
+    n,
+    dataset_name="hand-poses-dataset",
+    push_to_hub=True,
+    num_test_sample=1000,
+    output_dir="data",
 ):
     global joint_names, joint_name_to_index, SYSTEM_PROMPT, nthread
     """Generate n random hand poses using MuJoCo's rollout for batch simulation."""
@@ -315,7 +309,7 @@ def get_n_pose_with_rollout(
         return get_n_pose_and_upload(n, dataset_name, push_to_hub, num_test_sample)
 
     print("Using MuJoCo rollout module for batch simulation")
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     # Create multiple data instances for threading
     datas = [copy.copy(data) for _ in range(nthread)]
@@ -326,6 +320,7 @@ def get_n_pose_with_rollout(
 
     all_filenames = []
     all_joint_positions = []
+    index_mapping = {}
 
     for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
         current_batch_size = min(batch_size, n - batch_idx * batch_size)
@@ -377,7 +372,7 @@ def get_n_pose_with_rollout(
 
             # Save the image
             image_filename = f"pose_{pose_num}.png"
-            image_path = os.path.join("data", image_filename)
+            image_path = os.path.join(output_dir, image_filename)
             image = Image.fromarray(pixels)
             image.save(image_path)
 
@@ -387,6 +382,10 @@ def get_n_pose_with_rollout(
 
         all_filenames.extend(batch_filenames)
         all_joint_positions.extend(batch_joint_positions)
+        # build index mapping
+        for fname, angles in zip(batch_filenames, batch_joint_positions):
+            angle_list = [round(angles[joint_name_to_index[name]], 4) for name in joint_names]
+            index_mapping[fname] = angle_list
 
     print("Processing image data and creating conversations...")
 
@@ -408,7 +407,7 @@ def get_n_pose_with_rollout(
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "content": f"data/{all_filenames[i]}"},
+                    {"type": "image", "content": f"{output_dir}/{all_filenames[i]}"},
                     {"type": "text", "content": "<Pose>"},
                 ],
             },
@@ -423,7 +422,7 @@ def get_n_pose_with_rollout(
 
     # Save to JSONL
     conversations_json = [json.dumps(conv) for conv in conversations]
-    output_path = "data/conversations_dataset.jsonl"
+    output_path = os.path.join(output_dir, "conversations_dataset.jsonl")
     with open(output_path, "w") as f:
         for conv_json in conversations_json:
             f.write(conv_json + "\n")
@@ -431,7 +430,7 @@ def get_n_pose_with_rollout(
     # Load images
     images_data = []
     for image_path in tqdm(all_filenames, desc="Loading images"):
-        images_data.append(Image.open(f"data/{image_path}"))
+        images_data.append(Image.open(os.path.join(output_dir, image_path)))
 
     dataset_dict = {
         "image": images_data,
@@ -458,8 +457,15 @@ def get_n_pose_with_rollout(
         "generation_method": "GPU-accelerated MuJoCo with rollout batch simulation",
     }
 
-    with open(os.path.join("data", "_metadata.json"), "w") as f:
+    with open(os.path.join(output_dir, "_metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
+
+    # Save legacy index/name jsons
+    with open(os.path.join(output_dir, "_index.json"), "w") as f:
+        json.dump(index_mapping, f, indent=2)
+
+    with open(os.path.join(output_dir, "_name.json"), "w") as f:
+        json.dump(joint_names, f, indent=2)
 
     # Push to Hugging Face Hub or save locally
     if push_to_hub:
@@ -471,7 +477,7 @@ def get_n_pose_with_rollout(
             api = HfApi()
             print("Uploading metadata...")
             api.upload_file(
-                path_or_fileobj=os.path.join("data", "_metadata.json"),
+                path_or_fileobj=os.path.join(output_dir, "_metadata.json"),
                 path_in_repo="_metadata.json",
                 repo_id=dataset_name,
                 repo_type="dataset",
@@ -480,10 +486,10 @@ def get_n_pose_with_rollout(
         except Exception as e:
             print(f"Error uploading to Hugging Face Hub: {e}")
             print("Saving dataset locally instead")
-            dataset.save_to_disk("data/hf_dataset")
+            dataset.save_to_disk(os.path.join(output_dir, "hf_dataset"))
     else:
         print("Saving dataset locally")
-        dataset.save_to_disk("data/hf_dataset")
+        dataset.save_to_disk(os.path.join(output_dir, "hf_dataset"))
 
     # Clean up
     for img in images_data:
@@ -502,6 +508,12 @@ if __name__ == "__main__":
         description="Generate n random hand poses and upload to Hugging Face."
     )
     parser.add_argument("n", type=int, help="Number of poses to generate")
+    parser.add_argument(
+        "--hand",
+        type=str,
+        default="shadow_hand",
+        help="Name of the hand model (directory under ./models or explicit XML path)",
+    )
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -527,16 +539,34 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    print(f"Starting generation of {args.n} hand poses...")
+    # Initialise hand model and related globals
+    model, data, renderer, joint_names, joint_name_to_index = load_hand_model(args.hand)
+    SYSTEM_PROMPT = build_system_prompt(joint_names)
+
+    print(
+        f"Starting generation of {args.n} hand poses for hand '{args.hand}' using {nthread} threads..."
+    )
+
+    timestamp = time.strftime("%y%m%d%H%M%S")
+    output_dir = os.path.join("data", f"{args.hand}_{timestamp}")
+
     start_time = time.time()
 
     if args.use_rollout:
         dataset = get_n_pose_with_rollout(
-            args.n, args.dataset_name, not args.no_push, args.num_test_samples
+            args.n,
+            args.dataset_name,
+            not args.no_push,
+            args.num_test_samples,
+            output_dir,
         )
     else:
         dataset = get_n_pose_and_upload(
-            args.n, args.dataset_name, not args.no_push, args.num_test_samples
+            args.n,
+            args.dataset_name,
+            not args.no_push,
+            args.num_test_samples,
+            output_dir,
         )
 
     end_time = time.time()
